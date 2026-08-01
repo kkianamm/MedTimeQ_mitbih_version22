@@ -1,0 +1,52 @@
+{
+  "N": [
+    "A normal heartbeat has an expected narrow QRS morphology and timing relative to neighboring beats.",
+    "A normal or bundle-branch-conducted beat follows the underlying rhythm without premature supraventricular or ventricular activation.",
+    "A normal-class beat may be sinus, left bundle branch block, right bundle branch block, atrial escape, or junctional escape.",
+    "The beat is consistent with organized physiologic activation rather than an ectopic premature ventricular complex.",
+    "Normal-class beats generally preserve a stable relationship between atrial activity and the QRS complex.",
+    "The waveform resembles the patient's recurring baseline beat morphology.",
+    "The beat does not show the characteristic wide premature morphology of a ventricular ectopic beat.",
+    "The beat is not a fusion, paced, or unclassifiable complex."
+  ],
+  "S": [
+    "A supraventricular ectopic beat originates above the ventricles and usually has a relatively narrow QRS complex.",
+    "The beat occurs prematurely compared with the surrounding rhythm and may have an abnormal or hidden P wave.",
+    "Supraventricular ectopy includes atrial premature, aberrated atrial premature, junctional premature, and supraventricular premature beats.",
+    "The QRS may resemble the normal conducted beat because ventricular activation uses the usual conduction system.",
+    "An early beat with a narrow or only mildly aberrant QRS supports the supraventricular class.",
+    "The preceding RR interval is often shortened and may be followed by a noncompensatory pause.",
+    "The waveform is premature but lacks the strongly abnormal ventricular morphology typical of a PVC.",
+    "Atrial or junctional premature activation is the defining mechanism of this heartbeat class."
+  ],
+  "V": [
+    "A ventricular ectopic beat originates in the ventricles and commonly produces a wide abnormal QRS complex.",
+    "A premature ventricular contraction often occurs early and is followed by a compensatory pause.",
+    "Ventricular ectopic morphology differs substantially from the patient's normal conducted beats.",
+    "The QRS complex may be broad and bizarre because ventricular activation does not follow the normal His-Purkinje pathway.",
+    "The beat may represent a premature ventricular contraction or a ventricular escape beat.",
+    "A discordant T wave may follow the abnormal ventricular depolarization.",
+    "The waveform is more consistent with ventricular origin than with a narrow supraventricular premature beat.",
+    "The beat is a ventricular complex rather than a fusion of simultaneous normal and ventricular activation."
+  ],
+  "F": [
+    "A fusion beat combines simultaneous normal conducted activation and ventricular ectopic activation.",
+    "Fusion morphology is intermediate between the patient's normal QRS and ventricular ectopic QRS shapes.",
+    "The complex contains features of both a normal beat and a premature ventricular contraction.",
+    "A fusion beat may have a QRS width and contour between the normal and ventricular templates.",
+    "The beat results when sinus and ventricular impulses depolarize different portions of the ventricles.",
+    "The morphology is hybrid rather than fully normal or fully ventricular ectopic.",
+    "Comparison with neighboring normal and PVC morphologies helps identify the fusion complex.",
+    "The defining feature is mixed activation from normal conduction and a ventricular focus."
+  ],
+  "Q": [
+    "The unknown class includes paced beats, fusion of paced and normal beats, and unclassifiable beats.",
+    "A paced beat may show a pacing artifact immediately before an abnormal paced QRS complex.",
+    "Fusion of paced and normal activation creates a hybrid morphology that does not fit ordinary fusion or normal classes.",
+    "An unclassifiable beat lacks sufficient reliable morphology for assignment to N, S, V, or F.",
+    "The waveform may be dominated by pacing, artifact, or an unusual morphology outside the principal AAMI groups.",
+    "This class is reserved for beats that cannot be confidently treated as normal, supraventricular, ventricular, or fusion.",
+    "A sharp pacing spike with subsequent ventricular capture supports the paced or unknown group.",
+    "Ambiguous annotation or paced activation is the defining context for the Q class."
+  ]
+}
