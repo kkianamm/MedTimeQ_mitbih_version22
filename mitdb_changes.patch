@@ -1,0 +1,553 @@
+diff --git a/configs/datasets/mitdb_biomedcoop.toml b/configs/datasets/mitdb_biomedcoop.toml
+new file mode 100644
+index 0000000..fab6a70
+--- /dev/null
++++ b/configs/datasets/mitdb_biomedcoop.toml
+@@ -0,0 +1,96 @@
++DEBUG = false
++
++task = "classification"
++model = "medtsllm"
++
++# 512 samples at 360 Hz = 1.42 seconds centered on the annotated R peak.
++# For a more conventional short beat window, use 256 and keep pred_len equal.
++history_len = 512
++pred_len = 512
++
++[data]
++dataset = "MITDB"
++mode = "multivariate"
++cols = "all"
++normalize = true
++step = 512
++
++[training]
++epochs = 20
++batch_size = 8
++optimizer = "adam"
++learning_rate = 1e-4
++dropout = 0.1
++loss = "ce"
++
++# MIT-BIH is extremely imbalanced; use the optional weighted-CE patch below.
++class_weighted = true
++class_weight_power = 0.5
++
++eval_metric = "f1"
++eval_metric_direction = "max"
++save_best = true
++
++[datasets.MITDB]
++version = "1.0.0"
++root = "data/mitdb"
++lead = "MLII"
++allow_lead_fallback = true
++trim_beats = 10
++include_q = true
++use_cache = true
++# Patient-disjoint validation records taken only from DS1.
++val_records = ["114", "119", "208", "223"]
++
++[models.medtsllm]
++d_model = 32
++d_ff = 128
++n_heads = 8
++num_tokens = 1024
++covariate_mode = "concat"
++embedding_downsample_mode = "linear"
++
++[models.medtsllm.patching]
++patch_len = 32
++stride = 16
++
++[models.medtsllm.prompting]
++input_stats_dim = 0
++input_stats_select = "all"
++dataset = true
++task = true
++# MIT-BIH has no PTB-XL-style demographics table. The loader emits only a
++# constant technical context, so keep clip=false for the clean benchmark.
++clip = false
++input_stats = false
++examples = false
++class_prompts = false
++class_prompts_path = "models/biomedcoop_prompts/mitdb_aami5.json"
++class_prompts_per_class = 3
++class_prompts_sample = true
++class_codes = ["N", "S", "V", "F", "Q"]
++
++[models.medtsllm.biomedcoop]
++enabled = true
++class_prompts_path = "models/biomedcoop_prompts/mitdb_aami5.json"
++class_codes = ["N", "S", "V", "F", "Q"]
++n_prompts = 8
++pool = "mean"
++tau = 2.0
++kdsp_lambda = 1.0
++sccm_lambda = 0.0
++
++[models.medtsllm.llm]
++enabled = true
++llm = "meta-llama/Llama-2-7b-hf"
++load_in_4bit = false
++load_in_8bit = false
++llm_layers = -1
++
++[setup]
++seed = 0
++device = "auto"
++dtype = "mixed"
++# Start with 0 while validating the loader; increase after the first successful run.
++num_workers = 0
++logger = "print"
+diff --git a/datasets/__init__.py b/datasets/__init__.py
+index 383aac5..1332890 100644
+--- a/datasets/__init__.py
++++ b/datasets/__init__.py
+@@ -7,6 +7,7 @@ from .bidmc import bidmc_datasets
+ from .ludb import ludb_datasets
+ from .dreams import dreams_datasets
+ from .ptbxl import ptbxl_datasets
++from .mitdb import mitdb_datasets
+ 
+ from .util import multi_2_uni_dataset
+ from .util import PretrainingDataset
+@@ -24,6 +25,7 @@ dataset_lookup = {
+     "ludb": ludb_datasets,
+     "dreams": dreams_datasets,
+     "PTB-XL": ptbxl_datasets,
++    "MITDB": mitdb_datasets,
+ }
+ 
+ def get_dataset(config, split):
+diff --git a/datasets/mitdb.py b/datasets/mitdb.py
+new file mode 100644
+index 0000000..ea0a9ae
+--- /dev/null
++++ b/datasets/mitdb.py
+@@ -0,0 +1,288 @@
++"""MIT-BIH Arrhythmia beat-classification dataset for MedTsLLM.
++
++The original repository's PTB-XL loader performs one-label-per-record
++classification. MIT-BIH instead provides an annotation for each heartbeat, so
++this loader extracts a fixed-length window centered on every annotated beat and
++maps the original annotation symbols to the five AAMI heartbeat groups:
++
++    N: normal and bundle-branch/escape beats
++    S: supraventricular ectopic beats
++    V: ventricular ectopic beats
++    F: fusion of ventricular and normal beats
++    Q: paced, paced-fusion, and unclassifiable beats
++
++The standard de Chazal inter-patient partition is used: DS1 supplies train/val
++records and DS2 is held out for testing. Records 102, 104, 107, and 217 are not
++part of this protocol because they contain paced beats.
++"""
++
++from __future__ import annotations
++
++import hashlib
++from pathlib import Path
++from typing import Dict, Iterable, List, Sequence, Tuple
++
++import numpy as np
++
++# Reuse the generic whole-window classification base already implemented for
++# PTB-XL. A later cleanup may move ClassificationDataset to its own module.
++from .ptbxl import ClassificationDataset
++
++
++AAMI_CLASS_ORDER_5 = ["N", "S", "V", "F", "Q"]
++AAMI_CLASS_NAMES = {
++    "N": "Normal beat",
++    "S": "Supraventricular ectopic beat",
++    "V": "Ventricular ectopic beat",
++    "F": "Fusion beat",
++    "Q": "Unknown or paced beat",
++}
++
++# ANSI/AAMI EC57 grouping commonly used for MIT-BIH beat classification.
++AAMI_SYMBOL_TO_CLASS = {
++    # N: normal, bundle branch block, atrial/nodal escape
++    "N": "N",
++    "L": "N",
++    "R": "N",
++    "e": "N",
++    "j": "N",
++    # S: atrial/junctional/supraventricular premature beats
++    "A": "S",
++    "a": "S",
++    "J": "S",
++    "S": "S",
++    # V: premature ventricular contraction / ventricular escape
++    "V": "V",
++    "E": "V",
++    # F: fusion of ventricular and normal beat
++    "F": "F",
++    # Q: paced, fusion of paced and normal, or unclassifiable
++    "/": "Q",
++    "f": "Q",
++    "Q": "Q",
++}
++
++# Standard inter-patient split introduced by de Chazal et al.
++DS1_RECORDS = [
++    "101", "106", "108", "109", "112", "114", "115", "116", "118",
++    "119", "122", "124", "201", "203", "205", "207", "208", "209",
++    "215", "220", "223", "230",
++]
++DS2_RECORDS = [
++    "100", "103", "105", "111", "113", "117", "121", "123", "200",
++    "202", "210", "212", "213", "214", "219", "221", "222", "228",
++    "231", "232", "233", "234",
++]
++
++# Patient-disjoint validation subset selected from DS1. The remaining DS1
++# records are training data, while DS2 remains untouched until final testing.
++DEFAULT_VAL_RECORDS = ["114", "119", "208", "223"]
++
++
++class MITDBClassificationDataset(ClassificationDataset):
++    """Single-lead MIT-BIH heartbeat classification using AAMI groups."""
++
++    description = (
++        "The MIT-BIH Arrhythmia Database contains 48 approximately 30-minute, "
++        "two-channel ambulatory ECG recordings sampled at 360 Hz. This task "
++        "uses patient-independent heartbeat windows from the MLII lead and "
++        "groups expert beat annotations into the AAMI N, S, V, F, and Q classes."
++    )
++    task_description = (
++        "Classify the ECG window centered on the annotated heartbeat as one of "
++        "the AAMI heartbeat groups: N normal, S supraventricular ectopic, "
++        "V ventricular ectopic, F fusion, or Q unknown/paced."
++    )
++
++    sampling_rate = 360
++
++    def __init__(self, config, split):
++        cfg = config.get("datasets", {}).get("MITDB", {})
++
++        self.include_q = bool(cfg.get("include_q", True))
++        self.class_order = (
++            list(AAMI_CLASS_ORDER_5)
++            if self.include_q
++            else list(AAMI_CLASS_ORDER_5[:-1])
++        )
++        self.class_to_idx = {name: idx for idx, name in enumerate(self.class_order)}
++
++        self.lead = str(cfg.get("lead", "MLII"))
++        self.allow_lead_fallback = bool(cfg.get("allow_lead_fallback", True))
++        self.trim_beats = int(cfg.get("trim_beats", 10))
++        self.use_cache = bool(cfg.get("use_cache", True))
++        self.val_records = [str(x) for x in cfg.get("val_records", DEFAULT_VAL_RECORDS)]
++
++        root_value = str(cfg.get("root", "data/mitdb"))
++        root = Path(root_value).expanduser()
++        if not root.is_absolute():
++            root = (Path(__file__).resolve().parent.parent / root).resolve()
++        self.root = self._resolve_data_root(root)
++
++        super().__init__(config, split)
++
++    @property
++    def n_classes(self):
++        return len(self.class_order)
++
++    @property
++    def class_names(self):
++        return [AAMI_CLASS_NAMES[c] for c in self.class_order]
++
++    def _resolve_data_root(self, requested_root: Path) -> Path:
++        """Accept either a flat extraction or common nested zip directories."""
++        candidates = [
++            requested_root,
++            requested_root / "mitdb-1.0.0",
++            requested_root / "mitdb",
++        ]
++        for candidate in candidates:
++            if (candidate / "RECORDS").exists() or (candidate / "100.hea").exists():
++                return candidate
++        raise FileNotFoundError(
++            "MIT-BIH files were not found. Expected RECORDS and 100.hea under "
++            f"{requested_root}. Download/extract PhysioNet mitdb v1.0.0 there."
++        )
++
++    def _records_for_split(self, split: str) -> List[str]:
++        val_set = set(self.val_records)
++        unknown = val_set.difference(DS1_RECORDS)
++        if unknown:
++            raise ValueError(
++                f"MITDB val_records must be selected from DS1; invalid: {sorted(unknown)}"
++            )
++
++        if split == "train":
++            return [record for record in DS1_RECORDS if record not in val_set]
++        if split == "val":
++            return [record for record in DS1_RECORDS if record in val_set]
++        if split == "test":
++            return list(DS2_RECORDS)
++        raise ValueError(f"Unknown split: {split!r}")
++
++    def _cache_path(self, split: str, records: Sequence[str]) -> Path:
++        record_hash = hashlib.sha1(",".join(records).encode("utf-8")).hexdigest()[:8]
++        lead_tag = "".join(ch if ch.isalnum() else "_" for ch in self.lead)
++        q_tag = "aami5" if self.include_q else "aami4"
++        filename = (
++            f"{split}_h{int(self.history_len)}_{lead_tag}_{q_tag}_"
++            f"trim{self.trim_beats}_{record_hash}.npz"
++        )
++        return self.root / "cache" / filename
++
++    def _select_lead(self, record) -> Tuple[int, str]:
++        names = list(record.sig_name or [])
++        lower_names = [name.lower() for name in names]
++        requested = self.lead.lower()
++        if requested in lower_names:
++            idx = lower_names.index(requested)
++            return idx, names[idx]
++
++        if not self.allow_lead_fallback:
++            raise ValueError(
++                f"Lead {self.lead!r} not present in record {record.record_name}; "
++                f"available leads: {names}"
++            )
++        if not names:
++            raise ValueError(f"Record {record.record_name} contains no signal channels")
++        return 0, names[0]
++
++    @staticmethod
++    def _center_window(signal: np.ndarray, center: int, length: int) -> np.ndarray:
++        """Return a fixed window, zero-padding only at record boundaries."""
++        left = length // 2
++        right = length - left
++        start = int(center) - left
++        end = int(center) + right
++
++        src_start = max(start, 0)
++        src_end = min(end, signal.shape[0])
++        window = np.zeros((length,), dtype=np.float32)
++        dst_start = src_start - start
++        dst_end = dst_start + (src_end - src_start)
++        window[dst_start:dst_end] = signal[src_start:src_end]
++        return window
++
++    def _mapped_annotations(self, samples: Iterable[int], symbols: Iterable[str]):
++        mapped = []
++        for sample, symbol in zip(samples, symbols):
++            group = AAMI_SYMBOL_TO_CLASS.get(symbol)
++            if group is None or group not in self.class_to_idx:
++                continue
++            mapped.append((int(sample), group, symbol))
++
++        # Common preprocessing removes unstable start/end beats. Apply trimming
++        # after non-beat annotations have already been discarded.
++        if self.trim_beats > 0 and len(mapped) > 2 * self.trim_beats:
++            mapped = mapped[self.trim_beats:-self.trim_beats]
++        return mapped
++
++    def _build_split(self, records: Sequence[str]) -> Dict[str, np.ndarray]:
++        import wfdb
++
++        windows: List[np.ndarray] = []
++        labels: List[int] = []
++        descriptions: List[str] = []
++        crop = int(self.history_len)
++
++        for record_name in records:
++            path = str(self.root / record_name)
++            record = wfdb.rdrecord(path, physical=True)
++            annotation = wfdb.rdann(path, "atr")
++
++            lead_idx, actual_lead = self._select_lead(record)
++            signal = np.asarray(record.p_signal[:, lead_idx], dtype=np.float32)
++            mapped = self._mapped_annotations(annotation.sample, annotation.symbol)
++
++            for sample, group, _original_symbol in mapped:
++                beat = self._center_window(signal, sample, crop)
++                windows.append(beat[:, None])  # [T, 1]
++                labels.append(self.class_to_idx[group])
++                # No target label or patient ID is included, preventing text leakage.
++                descriptions.append(
++                    "ECG context: "
++                    f'{{"database": "MIT-BIH Arrhythmia", '
++                    f'"lead": "{actual_lead}", '
++                    f'"sampling_rate_hz": {int(record.fs)}}}'
++                )
++
++        if not windows:
++            raise RuntimeError(
++                f"No mapped MIT-BIH beats were produced from records: {records}"
++            )
++
++        data = np.stack(windows).astype(np.float32, copy=False)
++        targets = np.asarray(labels, dtype=np.int64)
++        text = np.asarray(descriptions, dtype=str)
++        return {"data": data, "labels": targets, "descriptions": text}
++
++    def get_data(self, split=None):
++        split = split or self.split
++        records = self._records_for_split(split)
++        cache_path = self._cache_path(split, records)
++
++        if self.use_cache and cache_path.exists():
++            cached = np.load(cache_path, allow_pickle=False)
++            return {
++                "data": cached["data"],
++                "labels": cached["labels"],
++                "descriptions": cached["descriptions"].tolist(),
++            }
++
++        result = self._build_split(records)
++        if self.use_cache:
++            cache_path.parent.mkdir(parents=True, exist_ok=True)
++            np.savez_compressed(
++                cache_path,
++                data=result["data"],
++                labels=result["labels"],
++                descriptions=result["descriptions"],
++            )
++
++        result["descriptions"] = result["descriptions"].tolist()
++        return result
++
++
++mitdb_datasets = {
++    "classification": MITDBClassificationDataset,
++}
+diff --git a/models/biomedcoop_prompts/mitdb_aami5.json b/models/biomedcoop_prompts/mitdb_aami5.json
+new file mode 100644
+index 0000000..af70f63
+--- /dev/null
++++ b/models/biomedcoop_prompts/mitdb_aami5.json
+@@ -0,0 +1,52 @@
++{
++  "N": [
++    "A normal heartbeat has an expected narrow QRS morphology and timing relative to neighboring beats.",
++    "A normal or bundle-branch-conducted beat follows the underlying rhythm without premature supraventricular or ventricular activation.",
++    "A normal-class beat may be sinus, left bundle branch block, right bundle branch block, atrial escape, or junctional escape.",
++    "The beat is consistent with organized physiologic activation rather than an ectopic premature ventricular complex.",
++    "Normal-class beats generally preserve a stable relationship between atrial activity and the QRS complex.",
++    "The waveform resembles the patient's recurring baseline beat morphology.",
++    "The beat does not show the characteristic wide premature morphology of a ventricular ectopic beat.",
++    "The beat is not a fusion, paced, or unclassifiable complex."
++  ],
++  "S": [
++    "A supraventricular ectopic beat originates above the ventricles and usually has a relatively narrow QRS complex.",
++    "The beat occurs prematurely compared with the surrounding rhythm and may have an abnormal or hidden P wave.",
++    "Supraventricular ectopy includes atrial premature, aberrated atrial premature, junctional premature, and supraventricular premature beats.",
++    "The QRS may resemble the normal conducted beat because ventricular activation uses the usual conduction system.",
++    "An early beat with a narrow or only mildly aberrant QRS supports the supraventricular class.",
++    "The preceding RR interval is often shortened and may be followed by a noncompensatory pause.",
++    "The waveform is premature but lacks the strongly abnormal ventricular morphology typical of a PVC.",
++    "Atrial or junctional premature activation is the defining mechanism of this heartbeat class."
++  ],
++  "V": [
++    "A ventricular ectopic beat originates in the ventricles and commonly produces a wide abnormal QRS complex.",
++    "A premature ventricular contraction often occurs early and is followed by a compensatory pause.",
++    "Ventricular ectopic morphology differs substantially from the patient's normal conducted beats.",
++    "The QRS complex may be broad and bizarre because ventricular activation does not follow the normal His-Purkinje pathway.",
++    "The beat may represent a premature ventricular contraction or a ventricular escape beat.",
++    "A discordant T wave may follow the abnormal ventricular depolarization.",
++    "The waveform is more consistent with ventricular origin than with a narrow supraventricular premature beat.",
++    "The beat is a ventricular complex rather than a fusion of simultaneous normal and ventricular activation."
++  ],
++  "F": [
++    "A fusion beat combines simultaneous normal conducted activation and ventricular ectopic activation.",
++    "Fusion morphology is intermediate between the patient's normal QRS and ventricular ectopic QRS shapes.",
++    "The complex contains features of both a normal beat and a premature ventricular contraction.",
++    "A fusion beat may have a QRS width and contour between the normal and ventricular templates.",
++    "The beat results when sinus and ventricular impulses depolarize different portions of the ventricles.",
++    "The morphology is hybrid rather than fully normal or fully ventricular ectopic.",
++    "Comparison with neighboring normal and PVC morphologies helps identify the fusion complex.",
++    "The defining feature is mixed activation from normal conduction and a ventricular focus."
++  ],
++  "Q": [
++    "The unknown class includes paced beats, fusion of paced and normal beats, and unclassifiable beats.",
++    "A paced beat may show a pacing artifact immediately before an abnormal paced QRS complex.",
++    "Fusion of paced and normal activation creates a hybrid morphology that does not fit ordinary fusion or normal classes.",
++    "An unclassifiable beat lacks sufficient reliable morphology for assignment to N, S, V, or F.",
++    "The waveform may be dominated by pacing, artifact, or an unusual morphology outside the principal AAMI groups.",
++    "This class is reserved for beats that cannot be confidently treated as normal, supraventricular, ventricular, or fusion.",
++    "A sharp pacing spike with subsequent ventricular capture supports the paced or unknown group.",
++    "Ambiguous annotation or paced activation is the defining context for the Q class."
++  ]
++}
+diff --git a/requirements.txt b/requirements.txt
+index 7d2b497..9623526 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -22,3 +22,6 @@ bayesian-optimization >= 1.4.0
+ 
+ wandb >= 0.16.4
+ tensorboard >= 2.16.0
++
++# PhysioNet WFDB reader pinned to avoid upgrading the repo's NumPy <1.25 environment.
++wfdb == 4.1.2
+diff --git a/scripts/check_mitdb.py b/scripts/check_mitdb.py
+new file mode 100755
+index 0000000..f0f0db5
+--- /dev/null
++++ b/scripts/check_mitdb.py
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++"""Check the MIT-BIH download and print AAMI class counts for each split."""
++
++from collections import Counter
++from pathlib import Path
++import sys
++
++REPO_ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPO_ROOT))
++
++import toml
++
++from datasets.mitdb import MITDBClassificationDataset
++from utils import dict_to_object
++
++
++def main():
++    config_path = REPO_ROOT / "configs/datasets/mitdb_biomedcoop.toml"
++    config = dict_to_object(toml.load(config_path))
++
++    for split in ("train", "val", "test"):
++        dataset = MITDBClassificationDataset(config, split)
++        counts = Counter(dataset.labels.tolist())
++        named = {
++            dataset.class_order[index]: counts.get(index, 0)
++            for index in range(dataset.n_classes)
++        }
++        print(
++            f"{split:>5}: samples={len(dataset):6d}, "
++            f"shape={tuple(dataset.records.shape)}, counts={named}"
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tasks/classification.py b/tasks/classification.py
+index 5695324..9768dd3 100644
+--- a/tasks/classification.py
++++ b/tasks/classification.py
+@@ -116,7 +116,21 @@ class ClassificationTask(BaseTask):
+         if loss_name in ("bce",) or is_binary:
+             self.loss_fn = torch.nn.BCEWithLogitsLoss()
+         elif loss_name in ("ce", "cross_entropy", "auto"):
+-            self.loss_fn = torch.nn.CrossEntropyLoss()
++            weights = None
++            if self.config.training.get("class_weighted", False):
++                counts = torch.bincount(
++                    self.train_dataset.labels.long(),
++                    minlength=self.train_dataset.n_classes,
++                ).float()
++                power = float(self.config.training.get("class_weight_power", 0.5))
++                present = counts > 0
++                weights = torch.zeros_like(counts)
++                weights[present] = counts[present].pow(-power)
++                weights[present] /= weights[present].mean()
++                weights = weights.to(self.device)
++                print("Training class counts:", counts.int().tolist())
++                print("Cross-entropy weights:", weights.detach().cpu().tolist())
++            self.loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+         else:
+             raise ValueError(f"Invalid loss function selection: {loss_name}")
+         return self.loss_fn
