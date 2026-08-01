@@ -1,0 +1,128 @@
+DEBUG = false
+
+task = "classification"
+model = "tri_medtsllm"
+
+# 512 samples at 360 Hz = 1.42 seconds centered on the annotated R peak.
+# For a more conventional short beat window, use 256 and keep pred_len equal.
+history_len = 512
+pred_len = 512
+
+[data]
+dataset = "MITDB"
+mode = "multivariate"
+cols = "all"
+normalize = true
+step = 512
+
+[training]
+epochs = 20
+batch_size = 8
+optimizer = "adam"
+learning_rate = 1e-4
+dropout = 0.1
+loss = "ce"
+
+# MIT-BIH is extremely imbalanced; use the optional weighted-CE patch below.
+class_weighted = true
+class_weight_power = 0.5
+
+eval_metric = "f1_macro"
+eval_metric_direction = "max"
+save_best = true
+
+[datasets.MITDB]
+version = "1.0.0"
+root = "data/mit-bih"
+lead = "MLII"
+allow_lead_fallback = true
+trim_beats = 10
+include_q = true
+use_cache = true
+# Patient-disjoint validation records taken only from DS1.
+val_records = ["114", "119", "208", "223"]
+
+[models.medtsllm]
+d_model = 32
+d_ff = 128
+n_heads = 8
+num_tokens = 1024
+covariate_mode = "concat"
+embedding_downsample_mode = "linear"
+
+[models.medtsllm.patching]
+patch_len = 32
+stride = 16
+
+[models.medtsllm.prompting]
+input_stats_dim = 0
+input_stats_select = "all"
+dataset = true
+task = true
+# MIT-BIH has no PTB-XL-style demographics table. The loader emits only a
+# constant technical context, so keep clip=false for the clean benchmark.
+clip = false
+input_stats = false
+examples = false
+class_prompts = false
+class_prompts_path = "models/biomedcoop_prompts/mitdb_aami5.json"
+class_prompts_per_class = 3
+class_prompts_sample = true
+class_codes = ["N", "S", "V", "F", "Q"]
+
+[models.medtsllm.biomedcoop]
+enabled = true
+class_prompts_path = "models/biomedcoop_prompts/mitdb_aami5.json"
+class_codes = ["N", "S", "V", "F", "Q"]
+n_prompts = 8
+pool = "mean"
+tau = 2.0
+kdsp_lambda = 1.0
+sccm_lambda = 0.0
+
+[models.medtsllm.llm]
+enabled = true
+llm = "meta-llama/Llama-2-7b-hf"
+load_in_4bit = false
+load_in_8bit = false
+llm_layers = -1
+
+[setup]
+seed = 0
+device = "auto"
+dtype = "mixed"
+# Start with 0 while validating the loader; increase after the first successful run.
+num_workers = 0
+logger = "print"
+
+# ============================================================
+# MOMENT + BLIP-2-style Q-Former + BioMedCoOp
+# ============================================================
+
+[models.medtsllm.combined]
+q_dim = 512
+q_queries = 32
+q_depth = 4
+q_heads = 8
+dropout = 0.10
+
+[models.medtsllm.combined.moment]
+backend = "moment"
+model_id = "AutonLab/MOMENT-1-base"
+freeze = true
+unfreeze_last_n = 0
+trust_remote_code = true
+allow_local_fallback = false
+local_patch_size = 16
+max_leads = 64
+use_highres_windows = true
+save_frozen_backbone = false
+
+[models.medtsllm.combined.loss]
+med_ce = 0.15
+moment_ce = 0.15
+query_ce = 0.10
+alignment = 0.10
+query_diversity = 0.01
+biomedcoop = 1.0
+alignment_temperature = 0.10
